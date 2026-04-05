@@ -1,0 +1,1718 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>カブの大冒険</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #000;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+  overflow: hidden;
+  font-family: 'Courier New', monospace;
+  cursor: none;
+}
+canvas {
+  display: block;
+}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ============================================================
+// カブの大冒険 — Vertical Scrolling Shooter (Mouse Only)
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const W = 960;
+const H = 640;
+canvas.width = W;
+canvas.height = H;
+
+function resizeCanvas() {
+  const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width = (W * scale) + 'px';
+  canvas.style.height = (H * scale) + 'px';
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+// ============================================================
+// Mouse Input
+// ============================================================
+const mouse = { x: W / 2, y: H * 0.75, clicked: false };
+
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouse.x = (e.clientX - rect.left) * (W / rect.width);
+  mouse.y = (e.clientY - rect.top) * (H / rect.height);
+});
+canvas.addEventListener('mousedown', () => mouse.clicked = true);
+canvas.addEventListener('mouseup', () => mouse.clicked = false);
+
+// Touch support
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const t = e.touches[0];
+  mouse.x = (t.clientX - rect.left) * (W / rect.width);
+  mouse.y = (t.clientY - rect.top) * (H / rect.height);
+}, { passive: false });
+
+// ============================================================
+// Game State
+// ============================================================
+let gameState = 'title'; // title, difficulty, story, playing, gameover
+let storyScrollY = 0;
+let storyStartTime = 0;
+let score = 0;
+let combo = 0;
+let comboTimer = 0;
+let gameTime = 0;
+let warningTimer = 0;
+let warningActive = false;
+let screenShake = 0;
+let flashAlpha = 0;
+let highScore = parseInt(localStorage.getItem('mechaBlitzHigh2') || '0');
+
+// ============================================================
+// Difficulty Settings
+// ============================================================
+let selectedDifficulty = 0; // 0=easy, 1=normal, 2=hard
+const DIFFICULTY_NAMES = ['やさしい', 'ふつう', 'むずかしい'];
+const DIFFICULTY_COLORS = ['#44cc44', '#ffcc00', '#ff4444'];
+const DIFFICULTY_DESC = [
+  'HP多め・敵少なめ・弾遅い',
+  'バランス型・ほどよい緊張感',
+  'HP少なめ・敵多め・弾速い'
+];
+
+// Difficulty parameters: [easy, normal, hard]  ← 全体的に強化済み
+const DIFF = {
+  playerHp:      [4, 3, 2],
+  hitboxR:       [8, 12, 16],
+  enemySpawnBase:[120, 80, 50],
+  enemySpawnMin: [40, 25, 14],
+  enemyBulletSpd:[2, 3.5, 5.5],
+  enemyShootRate:[1.3, 0.8, 0.45],
+  invincTime:    [75, 45, 20],
+  difficultyRate:[4200, 2700, 1800],
+  killsPerItem:  [17, 19, 20],   // killカウンター方式: この数倒すとアイテム1個
+  warningInterval:[2200, 1600, 1100],
+};
+
+function getDiff(key) { return DIFF[key][selectedDifficulty]; }
+
+// ============================================================
+// Player
+// ============================================================
+const player = {
+  x: W / 2, y: H * 0.75,
+  w: 30, h: 40,
+  hp: 5, maxHp: 5,
+  power: 1, // 1-5
+  shootCooldown: 0,
+  invincible: 0,
+  animFrame: 0,
+};
+
+const SHOOT_COOLDOWN_BASE = 6;
+const PLAYER_SPEED = 8;
+
+// ============================================================
+// Arrays
+// ============================================================
+let playerBullets = [];
+let enemyBullets = [];
+let enemies = [];
+let particles = [];
+let items = []; // Power-up items
+let killCounter = 0; // 次のアイテムまでのkill数トラッカー
+let nextItemAt = 0;  // このkill数に達したらアイテムドロップ
+
+// ============================================================
+// Background stars
+// ============================================================
+const stars = [];
+for (let i = 0; i < 80; i++) {
+  stars.push({
+    x: Math.random() * W,
+    y: Math.random() * H,
+    speed: 0.5 + Math.random() * 2,
+    size: 0.5 + Math.random() * 1.5,
+    brightness: 0.3 + Math.random() * 0.7
+  });
+}
+
+// Building silhouettes for parallax
+const buildings = [];
+for (let i = 0; i < 30; i++) {
+  buildings.push({
+    x: Math.random() * W,
+    y: Math.random() * H,
+    w: 20 + Math.random() * 50,
+    h: 30 + Math.random() * 80,
+    speed: 0.8 + Math.random() * 0.5
+  });
+}
+
+// ============================================================
+// Draw: Lv5 Transformer Robot (カブがロボットに変身!)
+// ============================================================
+function drawKabuTransformer(x, y, t, alpha = 1.0) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(x, y);
+
+  const hue = (t * 4) % 360;
+  const hue2 = (hue + 120) % 360;
+  const hue3 = (hue + 240) % 360;
+  const pulse = Math.sin(t * 0.25) * 0.5 + 0.5; // 0〜1でパルス
+  const bob = Math.sin(t * 0.1) * 3;
+
+  // ---- 超派手な外側オーラ (多重リング)
+  for (let r = 0; r < 4; r++) {
+    const ringHue = (hue + r * 30) % 360;
+    const rRadius = 46 + r * 8 + Math.sin(t * 0.2 + r) * 4;
+    ctx.strokeStyle = `hsla(${ringHue},100%,65%,${0.4 - r * 0.07})`;
+    ctx.lineWidth = 3 - r * 0.4;
+    ctx.shadowColor = `hsl(${ringHue},100%,60%)`;
+    ctx.shadowBlur = 12 + pulse * 10;
+    ctx.beginPath();
+    ctx.arc(0, bob, rRadius, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+
+  // ---- 回転するエネルギーパーティクル
+  for (let i = 0; i < 8; i++) {
+    const angle = t * 0.1 + (Math.PI * 2 / 8) * i;
+    const dist = 50 + Math.sin(t * 0.15 + i) * 6;
+    const px = Math.cos(angle) * dist;
+    const py = Math.sin(angle) * dist + bob;
+    const pHue = (hue + i * 45) % 360;
+    ctx.fillStyle = `hsl(${pHue},100%,70%)`;
+    ctx.shadowColor = `hsl(${pHue},100%,60%)`;
+    ctx.shadowBlur = 8;
+    ctx.beginPath();
+    ctx.arc(px, py, 3 + pulse * 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+
+  // ---- 脚 (ロボット風、装甲プレート付き)
+  // 左脚
+  ctx.fillStyle = `hsl(${hue2},70%,35%)`;
+  ctx.fillRect(-20, 18 + bob, 14, 22);
+  ctx.fillStyle = `hsl(${hue2},80%,55%)`;
+  ctx.fillRect(-20, 18 + bob, 14, 6); // 膝装甲
+  ctx.fillStyle = `hsl(${hue},100%,60%)`;
+  ctx.shadowColor = `hsl(${hue},100%,60%)`;
+  ctx.shadowBlur = 6;
+  ctx.fillRect(-19, 34 + bob, 12, 4); // スラスター
+  ctx.shadowBlur = 0;
+  // 右脚
+  ctx.fillStyle = `hsl(${hue2},70%,35%)`;
+  ctx.fillRect(6, 18 + bob, 14, 22);
+  ctx.fillStyle = `hsl(${hue2},80%,55%)`;
+  ctx.fillRect(6, 18 + bob, 14, 6);
+  ctx.fillStyle = `hsl(${hue},100%,60%)`;
+  ctx.shadowColor = `hsl(${hue},100%,60%)`;
+  ctx.shadowBlur = 6;
+  ctx.fillRect(7, 34 + bob, 12, 4);
+  ctx.shadowBlur = 0;
+
+  // ---- 腕 (巨大キャノン付き)
+  // 左腕
+  ctx.fillStyle = `hsl(${hue3},65%,30%)`;
+  ctx.fillRect(-42, -8 + bob, 20, 26);
+  ctx.fillStyle = `hsl(${hue3},75%,50%)`;
+  ctx.fillRect(-42, -8 + bob, 20, 7); // 肩アーマー
+  // キャノン砲口
+  ctx.fillStyle = '#333';
+  ctx.fillRect(-48, -2 + bob, 8, 14);
+  ctx.fillStyle = `hsl(${hue},100%,65%)`;
+  ctx.shadowColor = `hsl(${hue},100%,65%)`;
+  ctx.shadowBlur = 10 + pulse * 8;
+  ctx.beginPath();
+  ctx.arc(-48, 5 + bob, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  // 右腕
+  ctx.fillStyle = `hsl(${hue3},65%,30%)`;
+  ctx.fillRect(22, -8 + bob, 20, 26);
+  ctx.fillStyle = `hsl(${hue3},75%,50%)`;
+  ctx.fillRect(22, -8 + bob, 20, 7);
+  ctx.fillStyle = '#333';
+  ctx.fillRect(40, -2 + bob, 8, 14);
+  ctx.fillStyle = `hsl(${hue},100%,65%)`;
+  ctx.shadowColor = `hsl(${hue},100%,65%)`;
+  ctx.shadowBlur = 10 + pulse * 8;
+  ctx.beginPath();
+  ctx.arc(48, 5 + bob, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // ---- 胴体 (ヘキサゴン装甲)
+  ctx.fillStyle = `hsl(${hue2},60%,28%)`;
+  ctx.beginPath();
+  ctx.moveTo(-22, -18 + bob);
+  ctx.lineTo(22, -18 + bob);
+  ctx.lineTo(28, 0 + bob);
+  ctx.lineTo(22, 18 + bob);
+  ctx.lineTo(-22, 18 + bob);
+  ctx.lineTo(-28, 0 + bob);
+  ctx.closePath();
+  ctx.fill();
+
+  // 胸装甲
+  ctx.fillStyle = `hsl(${hue2},70%,42%)`;
+  ctx.beginPath();
+  ctx.moveTo(-16, -14 + bob);
+  ctx.lineTo(16, -14 + bob);
+  ctx.lineTo(20, 2 + bob);
+  ctx.lineTo(16, 14 + bob);
+  ctx.lineTo(-16, 14 + bob);
+  ctx.lineTo(-20, 2 + bob);
+  ctx.closePath();
+  ctx.fill();
+
+  // コアリアクター (超輝く)
+  ctx.fillStyle = `hsl(${hue},100%,70%)`;
+  ctx.shadowColor = `hsl(${hue},100%,60%)`;
+  ctx.shadowBlur = 20 + pulse * 15;
+  ctx.beginPath();
+  ctx.arc(0, 0 + bob, 9 + pulse * 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(0, 0 + bob, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // 胴体の発光ライン
+  for (let i = 0; i < 3; i++) {
+    ctx.strokeStyle = `hsla(${(hue + i * 40) % 360},100%,70%,0.6)`;
+    ctx.lineWidth = 1.5;
+    ctx.shadowColor = `hsl(${(hue + i * 40) % 360},100%,60%)`;
+    ctx.shadowBlur = 5;
+    ctx.beginPath();
+    ctx.moveTo(-14 + i * 4, -10 + bob);
+    ctx.lineTo(-10 + i * 4, 10 + bob);
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+
+  // ---- 頭部 (カブの葉っぱ付きロボットヘッド)
+  ctx.fillStyle = `hsl(${hue2},60%,25%)`;
+  ctx.fillRect(-14, -36 + bob, 28, 20);
+
+  // バイザー (光る目)
+  ctx.fillStyle = `hsl(${hue},100%,65%)`;
+  ctx.shadowColor = `hsl(${hue},100%,60%)`;
+  ctx.shadowBlur = 12 + pulse * 8;
+  ctx.fillRect(-10, -30 + bob, 20, 7);
+  // バイザー中央スリット
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(-8, -28 + bob, 7, 3);
+  ctx.fillRect(1, -28 + bob, 7, 3);
+  ctx.shadowBlur = 0;
+
+  // 頭部アンテナ
+  ctx.strokeStyle = `hsl(${hue3},100%,65%)`;
+  ctx.lineWidth = 2.5;
+  ctx.shadowColor = `hsl(${hue3},100%,60%)`;
+  ctx.shadowBlur = 8;
+  ctx.beginPath();
+  ctx.moveTo(0, -36 + bob);
+  ctx.lineTo(-12, -50 + bob);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(0, -36 + bob);
+  ctx.lineTo(12, -50 + bob);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // アンテナ先端の光球
+  ctx.fillStyle = `hsl(${hue3},100%,70%)`;
+  ctx.shadowColor = `hsl(${hue3},100%,60%)`;
+  ctx.shadowBlur = 10 + pulse * 8;
+  ctx.beginPath();
+  ctx.arc(-12, -50 + bob, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(12, -50 + bob, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // ---- カブの葉っぱ (ロボット化しても残る)
+  ctx.fillStyle = '#3ccc3c';
+  ctx.strokeStyle = '#1a8a1a';
+  ctx.lineWidth = 1.5;
+  ctx.shadowColor = '#00ff00';
+  ctx.shadowBlur = 8 + pulse * 6;
+  // 中央葉
+  ctx.beginPath();
+  ctx.moveTo(0, -36 + bob);
+  ctx.quadraticCurveTo(-3, -52 + bob, 2, -60 + bob);
+  ctx.quadraticCurveTo(5, -52 + bob, 0, -36 + bob);
+  ctx.fill();
+  ctx.stroke();
+  // 左葉
+  ctx.beginPath();
+  ctx.moveTo(-2, -38 + bob);
+  ctx.quadraticCurveTo(-18, -52 + bob, -12, -60 + bob);
+  ctx.quadraticCurveTo(-5, -50 + bob, -2, -38 + bob);
+  ctx.fill();
+  ctx.stroke();
+  // 右葉
+  ctx.beginPath();
+  ctx.moveTo(2, -38 + bob);
+  ctx.quadraticCurveTo(18, -52 + bob, 12, -60 + bob);
+  ctx.quadraticCurveTo(5, -50 + bob, 2, -38 + bob);
+  ctx.fill();
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // ---- 変身エフェクト: 稲妻
+  ctx.strokeStyle = `hsla(${hue},100%,80%,${0.4 + pulse * 0.4})`;
+  ctx.lineWidth = 1.5;
+  ctx.shadowColor = `hsl(${hue},100%,70%)`;
+  ctx.shadowBlur = 8;
+  for (let i = 0; i < 3; i++) {
+    const startAngle = t * 0.15 + (Math.PI * 2 / 3) * i;
+    const ex = Math.cos(startAngle) * 52;
+    const ey = Math.sin(startAngle) * 52 + bob;
+    ctx.beginPath();
+    ctx.moveTo(ex, ey);
+    ctx.lineTo(ex * 0.4 + (Math.random() - 0.5) * 10, ey * 0.4);
+    ctx.lineTo(0, 0 + bob);
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+
+  ctx.restore();
+}
+
+// ============================================================
+// Draw: Player Kabu (Turnip Character) — Lv1〜4
+// ============================================================
+function drawPlayerMecha(x, y, power, animFrame, alpha = 1.0) {
+  // Lv5はトランスフォーマー変身形態を描画
+  if (power >= 5) {
+    drawKabuTransformer(x, y, animFrame, alpha);
+    return;
+  }
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(x, y);
+
+  const t = animFrame;
+  const bob = Math.sin(t * 0.12) * 2;
+  const legSwing = Math.sin(t * 0.2) * 8;
+
+  // -- Legs (small, dangling)
+  ctx.strokeStyle = '#c040a0';
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  // Left leg
+  ctx.beginPath();
+  ctx.moveTo(-6, 16 + bob);
+  ctx.lineTo(-8 - legSwing * 0.3, 28 + bob);
+  ctx.stroke();
+  // Right leg
+  ctx.beginPath();
+  ctx.moveTo(6, 16 + bob);
+  ctx.lineTo(8 + legSwing * 0.3, 28 + bob);
+  ctx.stroke();
+
+  // -- Arms (hands on hips pose)
+  ctx.strokeStyle = '#c040a0';
+  ctx.lineWidth = 3;
+  // Left arm
+  ctx.beginPath();
+  ctx.moveTo(-14, 2 + bob);
+  ctx.quadraticCurveTo(-22, 8 + bob, -18, 14 + bob);
+  ctx.stroke();
+  // Right arm
+  ctx.beginPath();
+  ctx.moveTo(14, 2 + bob);
+  ctx.quadraticCurveTo(22, 8 + bob, 18, 14 + bob);
+  ctx.stroke();
+
+  // -- Main body (turnip shape — purple/magenta)
+  ctx.fillStyle = '#c040a0';
+  ctx.beginPath();
+  ctx.moveTo(0, -18 + bob);
+  ctx.bezierCurveTo(-20, -16 + bob, -20, 10 + bob, -12, 18 + bob);
+  ctx.lineTo(12, 18 + bob);
+  ctx.bezierCurveTo(20, 10 + bob, 20, -16 + bob, 0, -18 + bob);
+  ctx.closePath();
+  ctx.fill();
+
+  // Body highlight
+  ctx.fillStyle = 'rgba(220,100,180,0.4)';
+  ctx.beginPath();
+  ctx.moveTo(-2, -16 + bob);
+  ctx.bezierCurveTo(-16, -14 + bob, -16, 6 + bob, -10, 14 + bob);
+  ctx.lineTo(-4, 14 + bob);
+  ctx.bezierCurveTo(-8, 4 + bob, -8, -10 + bob, -2, -16 + bob);
+  ctx.closePath();
+  ctx.fill();
+
+  // -- Face (yellow circle)
+  ctx.fillStyle = '#f5d442';
+  ctx.beginPath();
+  ctx.arc(0, 2 + bob, 12, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Eyes
+  ctx.fillStyle = '#222';
+  ctx.beginPath();
+  ctx.arc(-4, 0 + bob, 1.8, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(4, 0 + bob, 1.8, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Beak
+  ctx.fillStyle = '#e88020';
+  ctx.beginPath();
+  ctx.moveTo(0, 2 + bob);
+  ctx.lineTo(-3, 5 + bob);
+  ctx.lineTo(0, 8 + bob);
+  ctx.lineTo(3, 5 + bob);
+  ctx.closePath();
+  ctx.fill();
+
+  // -- Leaves
+  ctx.fillStyle = '#2eaa2e';
+  ctx.strokeStyle = '#1a7a1a';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(0, -18 + bob);
+  ctx.quadraticCurveTo(-4, -34 + bob, 2, -40 + bob);
+  ctx.quadraticCurveTo(6, -34 + bob, 0, -18 + bob);
+  ctx.fill(); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-2, -17 + bob);
+  ctx.quadraticCurveTo(-16, -32 + bob, -10, -38 + bob);
+  ctx.quadraticCurveTo(-4, -30 + bob, -2, -17 + bob);
+  ctx.fill(); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(2, -17 + bob);
+  ctx.quadraticCurveTo(16, -32 + bob, 10, -38 + bob);
+  ctx.quadraticCurveTo(4, -30 + bob, 2, -17 + bob);
+  ctx.fill(); ctx.stroke();
+
+  // -- Power aura rings
+  if (power >= 2) {
+    ctx.strokeStyle = 'rgba(0,229,255,0.4)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(0, 2 + bob, 22, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  if (power >= 3) {
+    ctx.strokeStyle = 'rgba(100,255,100,0.5)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(0, 2 + bob, 25, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  if (power >= 4) {
+    ctx.strokeStyle = 'rgba(255,215,0,0.5)';
+    ctx.lineWidth = 2.5;
+    ctx.shadowColor = '#ffd700';
+    ctx.shadowBlur = 8;
+    ctx.beginPath();
+    ctx.arc(0, 2 + bob, 28, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    for (let i = 0; i < 4; i++) {
+      const angle = t * 0.08 + (Math.PI * 2 / 4) * i;
+      const sx = Math.cos(angle) * 30;
+      const sy = Math.sin(angle) * 30 + bob;
+      ctx.fillStyle = '#ffd700';
+      ctx.beginPath();
+      ctx.arc(sx, sy + 2, 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  ctx.restore();
+}
+
+// ============================================================
+// Draw: Enemies (top-down style)
+// ============================================================
+function drawDrone(x, y, animT) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(Math.PI); // Face downward
+
+  ctx.fillStyle = '#8b0000';
+  ctx.beginPath();
+  ctx.moveTo(0, -10);
+  ctx.lineTo(-8, 6);
+  ctx.lineTo(8, 6);
+  ctx.closePath();
+  ctx.fill();
+
+  // Wings
+  ctx.fillStyle = '#555';
+  const w = Math.sin(animT * 0.4) * 2;
+  ctx.fillRect(-16, 0 + w, 8, 3);
+  ctx.fillRect(8, 0 - w, 8, 3);
+
+  // Eye
+  ctx.fillStyle = '#ff0';
+  ctx.shadowColor = '#ff0';
+  ctx.shadowBlur = 4;
+  ctx.beginPath();
+  ctx.arc(0, 0, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  ctx.restore();
+}
+
+function drawTank(x, y, animT) {
+  ctx.save();
+  ctx.translate(x, y);
+
+  // Body
+  ctx.fillStyle = '#5c0000';
+  ctx.fillRect(-14, -12, 28, 24);
+
+  // Armor plates
+  ctx.fillStyle = '#8b0000';
+  ctx.fillRect(-18, -8, 6, 16);
+  ctx.fillRect(12, -8, 6, 16);
+
+  // Turret
+  ctx.fillStyle = '#444';
+  ctx.fillRect(-3, 8, 6, 10);
+
+  // Eye
+  ctx.fillStyle = '#ff4444';
+  ctx.shadowColor = '#ff4444';
+  ctx.shadowBlur = 5;
+  ctx.beginPath();
+  ctx.arc(0, -2, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  ctx.restore();
+}
+
+function drawHeavyMecha(x, y, animT) {
+  ctx.save();
+  ctx.translate(x, y);
+  const sway = Math.sin(animT * 0.1) * 1;
+
+  // Main body
+  ctx.fillStyle = '#6b0000';
+  ctx.fillRect(-22, -20 + sway, 44, 40);
+
+  // Chest armor
+  ctx.fillStyle = '#8b0000';
+  ctx.beginPath();
+  ctx.moveTo(-20, -18 + sway);
+  ctx.lineTo(20, -18 + sway);
+  ctx.lineTo(16, 5 + sway);
+  ctx.lineTo(-16, 5 + sway);
+  ctx.closePath();
+  ctx.fill();
+
+  // Reactor
+  ctx.fillStyle = '#ff0000';
+  ctx.shadowColor = '#ff0000';
+  ctx.shadowBlur = 12;
+  ctx.beginPath();
+  ctx.arc(0, -5 + sway, 7, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // Shoulder missiles
+  ctx.fillStyle = '#444';
+  ctx.fillRect(-30, -14 + sway, 10, 10);
+  ctx.fillRect(20, -14 + sway, 10, 10);
+  ctx.fillStyle = '#e74c3c';
+  for (let i = 0; i < 3; i++) {
+    ctx.fillRect(-28 + i * 3, -12 + sway, 2, 6);
+    ctx.fillRect(22 + i * 3, -12 + sway, 2, 6);
+  }
+
+  // Arms
+  ctx.fillStyle = '#5c0000';
+  ctx.fillRect(-32, -6 + sway, 10, 20);
+  ctx.fillRect(22, -6 + sway, 10, 20);
+
+  // Head
+  ctx.fillStyle = '#4a0000';
+  ctx.fillRect(-10, -30 + sway, 20, 12);
+  // Eyes
+  ctx.fillStyle = '#ff0';
+  ctx.shadowColor = '#ff0';
+  ctx.shadowBlur = 6;
+  ctx.fillRect(-7, -26 + sway, 5, 3);
+  ctx.fillRect(2, -26 + sway, 5, 3);
+  ctx.shadowBlur = 0;
+  // Horn
+  ctx.fillStyle = '#e74c3c';
+  ctx.beginPath();
+  ctx.moveTo(0, -30 + sway);
+  ctx.lineTo(-3, -38 + sway);
+  ctx.lineTo(3, -38 + sway);
+  ctx.closePath();
+  ctx.fill();
+
+  // Cannon barrels (face down)
+  ctx.fillStyle = '#555';
+  ctx.fillRect(-4, 18, 3, 8);
+  ctx.fillRect(1, 18, 3, 8);
+
+  ctx.restore();
+}
+
+// ============================================================
+// Particles
+// ============================================================
+function spawnExplosion(x, y, count, color1, color2) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1 + Math.random() * 4;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 20 + Math.random() * 20,
+      maxLife: 40,
+      size: 2 + Math.random() * 4,
+      color: Math.random() > 0.5 ? color1 : color2
+    });
+  }
+}
+
+function spawnPowerUpEffect(x, y) {
+  for (let i = 0; i < 15; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 2 + Math.random() * 3;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 25 + Math.random() * 15,
+      maxLife: 40,
+      size: 2 + Math.random() * 3,
+      color: Math.random() > 0.5 ? '#00e5ff' : '#fff'
+    });
+  }
+}
+
+// ============================================================
+// Shooting (auto-fire based on power level)
+// ============================================================
+function playerShoot() {
+  if (player.shootCooldown > 0) return;
+
+  const p = player.power;
+  const x = player.x;
+  const y = player.y;
+
+  // Lv1: single laser
+  playerBullets.push({ x, y: y - 20, vx: 0, vy: -10, life: 80, wide: false });
+
+  if (p >= 2) {
+    // Lv2: + slight angle shots
+    playerBullets.push({ x: x - 12, y: y - 14, vx: -1.5, vy: -9.5, life: 80, wide: false });
+    playerBullets.push({ x: x + 12, y: y - 14, vx: 1.5, vy: -9.5, life: 80, wide: false });
+  }
+
+  if (p >= 3) {
+    // Lv3: + wider angled
+    playerBullets.push({ x: x - 20, y: y - 8, vx: -3, vy: -8.5, life: 80, wide: false });
+    playerBullets.push({ x: x + 20, y: y - 8, vx: 3, vy: -8.5, life: 80, wide: false });
+  }
+
+  if (p >= 4) {
+    // Lv4: + thick center beam
+    playerBullets.push({ x, y: y - 22, vx: 0, vy: -12, life: 80, wide: true });
+  }
+
+  if (p >= 5) {
+    // Lv5: + rear diagonal shots (cover all angles)
+    playerBullets.push({ x: x - 26, y: y, vx: -5, vy: -6, life: 80, wide: false });
+    playerBullets.push({ x: x + 26, y: y, vx: 5, vy: -6, life: 80, wide: false });
+    // Extra thick beam
+    playerBullets.push({ x: x - 6, y: y - 22, vx: -0.3, vy: -13, life: 80, wide: true });
+    playerBullets.push({ x: x + 6, y: y - 22, vx: 0.3, vy: -13, life: 80, wide: true });
+  }
+
+  // 連射速度を半分に（全レベル2倍）
+  const cooldowns = [30, 30, 25, 20, 15];
+  player.shootCooldown = cooldowns[Math.min(p, 5) - 1];
+}
+
+// ============================================================
+// Enemy Spawning
+// ============================================================
+let spawnTimer = 0;
+
+function spawnEnemy() {
+  const difficulty = Math.min(gameTime / 5400, 1); // Maxes ~90s (easy)
+  const roll = Math.random();
+
+  let type;
+  if (difficulty < 0.3) {
+    type = 'drone';
+  } else if (roll < 0.55 - difficulty * 0.15) {
+    type = 'drone';
+  } else if (roll < 0.85) {
+    type = 'tank';
+  } else {
+    type = 'heavy';
+  }
+
+  const enemy = {
+    type,
+    y: -40,
+    x: 60 + Math.random() * (W - 120),
+    animT: 0,
+    shootTimer: 120 + Math.random() * 120,
+    active: true
+  };
+
+  switch (type) {
+    case 'drone':
+      enemy.hp = 1; enemy.maxHp = 1;
+      enemy.w = 16; enemy.h = 16;
+      enemy.speed = 1.5 + difficulty;
+      enemy.score = 100;
+      break;
+    case 'tank':
+      enemy.hp = 2; enemy.maxHp = 2;
+      enemy.w = 28; enemy.h = 24;
+      enemy.speed = 0.8 + difficulty * 0.5;
+      enemy.score = 300;
+      break;
+    case 'heavy':
+      enemy.hp = 5; enemy.maxHp = 5;
+      enemy.w = 44; enemy.h = 40;
+      enemy.speed = 0.4 + difficulty * 0.3;
+      enemy.score = 800;
+      break;
+  }
+
+  enemies.push(enemy);
+}
+
+// ============================================================
+// Update
+// ============================================================
+function update() {
+  if (gameState !== 'playing') return;
+
+  gameTime++;
+  const difficulty = Math.min(gameTime / getDiff('difficultyRate'), 1);
+
+  // Warning
+  warningTimer++;
+  if (warningTimer >= getDiff('warningInterval')) {
+    warningTimer = 0;
+    warningActive = true;
+    setTimeout(() => {
+      warningActive = false;
+      for (let i = 0; i < 4 + Math.floor(difficulty * 4); i++) {
+        setTimeout(() => spawnEnemy(), i * 300);
+      }
+    }, 2000);
+  }
+
+  // -- Player follows mouse smoothly
+  const dx = mouse.x - player.x;
+  const dy = mouse.y - player.y;
+  player.x += dx * 0.15;
+  player.y += dy * 0.15;
+
+  // Keep in bounds
+  player.x = Math.max(20, Math.min(W - 20, player.x));
+  player.y = Math.max(20, Math.min(H - 20, player.y));
+
+  if (player.invincible > 0) player.invincible--;
+  player.animFrame++;
+
+  // Auto-fire
+  playerShoot();
+  if (player.shootCooldown > 0) player.shootCooldown--;
+
+  // -- Bullets
+  playerBullets = playerBullets.filter(b => {
+    b.x += b.vx;
+    b.y += b.vy;
+    b.life--;
+    return b.life > 0 && b.y > -20;
+  });
+
+  enemyBullets = enemyBullets.filter(b => {
+    b.x += b.vx;
+    b.y += b.vy;
+    b.life--;
+    return b.life > 0 && b.y < H + 20 && b.x > -20 && b.x < W + 20;
+  });
+
+  // -- Enemy spawning
+  const spawnRate = Math.max(getDiff('enemySpawnMin'), getDiff('enemySpawnBase') - difficulty * 80);
+  spawnTimer++;
+  if (spawnTimer >= spawnRate) {
+    spawnTimer = 0;
+    spawnEnemy();
+  }
+
+  // -- Enemy update
+  enemies = enemies.filter(e => {
+    e.y += e.speed;
+    e.animT++;
+
+    // Drone: slight side movement
+    if (e.type === 'drone') {
+      e.x += Math.sin(e.animT * 0.03) * 1;
+    }
+
+    // Shooting
+    e.shootTimer--;
+    const spdMul = getDiff('enemyBulletSpd') / 2;
+    const rateMul = getDiff('enemyShootRate');
+    if (e.shootTimer <= 0 && e.y > 30 && e.y < H * 0.6) {
+      if (e.type === 'tank') {
+        e.shootTimer = (160 + Math.random() * 100) * rateMul;
+        const angle = Math.atan2(player.y - e.y, player.x - e.x);
+        enemyBullets.push({
+          x: e.x, y: e.y + 12,
+          vx: Math.cos(angle) * getDiff('enemyBulletSpd'),
+          vy: Math.sin(angle) * getDiff('enemyBulletSpd'),
+          life: 200
+        });
+      } else if (e.type === 'heavy') {
+        e.shootTimer = (200 + Math.random() * 100) * rateMul;
+        for (let i = -1; i <= 1; i++) {
+          enemyBullets.push({
+            x: e.x + i * 10, y: e.y + 20,
+            vx: i * 0.8 * spdMul,
+            vy: getDiff('enemyBulletSpd'),
+            life: 200,
+            missile: true
+          });
+        }
+      }
+    }
+
+    return e.y < H + 60 && e.active;
+  });
+
+  // -- Items update
+  items = items.filter(item => {
+    item.y += item.speed;
+    item.animT++;
+
+    // Check pickup
+    const idx = item.x - player.x;
+    const idy = item.y - player.y;
+    if (Math.abs(idx) < 25 && Math.abs(idy) < 25) {
+      if (player.power < 5) {
+        player.power++;
+        spawnPowerUpEffect(player.x, player.y);
+        flashAlpha = 0.2;
+      }
+      score += 200;
+      return false;
+    }
+
+    return item.y < H + 20;
+  });
+
+  // -- Collision: player bullets -> enemies
+  playerBullets.forEach(b => {
+    enemies.forEach(e => {
+      if (!e.active) return;
+      const cdx = b.x - e.x;
+      const cdy = b.y - e.y;
+      const hitW = b.wide ? e.w / 2 + 8 : e.w / 2 + 4;
+      if (Math.abs(cdx) < hitW && Math.abs(cdy) < e.h / 2 + 4) {
+        e.hp--;
+        b.life = 0;
+        // Hit spark
+        for (let i = 0; i < 4; i++) {
+          const a = Math.random() * Math.PI * 2;
+          particles.push({
+            x: b.x, y: b.y,
+            vx: Math.cos(a) * 2, vy: Math.sin(a) * 2,
+            life: 8, maxLife: 8, size: 2, color: '#fff'
+          });
+        }
+
+        if (e.hp <= 0) {
+          e.active = false;
+          const size = e.type === 'heavy' ? 25 : (e.type === 'tank' ? 12 : 8);
+          spawnExplosion(e.x, e.y, size, '#ff6600', '#ffcc00');
+          combo++;
+          comboTimer = 120;
+          score += e.score * Math.min(combo, 10);
+          screenShake = e.type === 'heavy' ? 10 : 4;
+
+          // killカウンター方式: 15〜20体倒すと1個ドロップ
+          killCounter++;
+          if (killCounter >= nextItemAt) {
+            killCounter = 0;
+            const base = getDiff('killsPerItem');
+            nextItemAt = base + Math.floor(Math.random() * 4) - 1; // ±ランダム
+            items.push({ x: e.x, y: e.y, speed: 1.5, animT: 0 });
+          }
+        }
+      }
+    });
+  });
+
+  // -- Collision: enemy/bullet -> player
+  if (player.invincible <= 0) {
+    const hitR = getDiff('hitboxR');
+
+    enemies.forEach(e => {
+      if (!e.active) return;
+      if (Math.abs(player.x - e.x) < hitR + e.w / 2 &&
+          Math.abs(player.y - e.y) < hitR + e.h / 2) {
+        playerHit();
+      }
+    });
+
+    enemyBullets.forEach(b => {
+      if (Math.abs(player.x - b.x) < hitR + 4 &&
+          Math.abs(player.y - b.y) < hitR + 4) {
+        b.life = 0;
+        playerHit();
+      }
+    });
+  }
+
+  // Combo timer
+  if (comboTimer > 0) {
+    comboTimer--;
+    if (comboTimer <= 0) combo = 0;
+  }
+
+  // Particles
+  particles = particles.filter(p => {
+    p.x += p.vx;
+    p.y += p.vy;
+    p.life--;
+    return p.life > 0;
+  });
+
+  // Effects
+  if (screenShake > 0) screenShake *= 0.85;
+  if (screenShake < 0.5) screenShake = 0;
+  if (flashAlpha > 0) flashAlpha -= 0.03;
+
+  // Time-based score
+  if (gameTime % 10 === 0) score += 1;
+}
+
+function playerHit() {
+  player.hp--;
+  player.invincible = getDiff('invincTime');
+  screenShake = 6;
+  flashAlpha = 0.3;
+  combo = 0;
+  comboTimer = 0;
+
+  // ダメージでパワーが1に完全リセット
+  player.power = 1;
+  killCounter = 0; // killカウンターもリセット
+
+  spawnExplosion(player.x, player.y, 10, '#fff', '#88f');
+
+  if (player.hp <= 0) {
+    gameState = 'gameover';
+    if (score > highScore) {
+      highScore = score;
+      localStorage.setItem('mechaBlitzHigh2', highScore.toString());
+    }
+    spawnExplosion(player.x, player.y, 40, '#ff4400', '#ffcc00');
+  }
+}
+
+// ============================================================
+// Render
+// ============================================================
+function render() {
+  ctx.save();
+
+  if (screenShake > 0) {
+    ctx.translate(
+      (Math.random() - 0.5) * screenShake * 2,
+      (Math.random() - 0.5) * screenShake * 2
+    );
+  }
+
+  // -- Background: deep space gradient
+  const skyGrad = ctx.createLinearGradient(0, 0, 0, H);
+  skyGrad.addColorStop(0, '#050510');
+  skyGrad.addColorStop(0.5, '#0a0a2e');
+  skyGrad.addColorStop(1, '#1a0a3e');
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars (scrolling down)
+  stars.forEach(s => {
+    s.y += s.speed;
+    if (s.y > H) { s.y = -2; s.x = Math.random() * W; }
+    ctx.globalAlpha = s.brightness;
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(s.x, s.y, s.size, s.size);
+  });
+  ctx.globalAlpha = 1;
+
+  // Building silhouettes (scrolling down, faint)
+  ctx.globalAlpha = 0.08;
+  ctx.fillStyle = '#4488aa';
+  buildings.forEach(b => {
+    b.y += b.speed;
+    if (b.y > H + 100) { b.y = -100; b.x = Math.random() * W; }
+    ctx.fillRect(b.x, b.y, b.w, b.h);
+  });
+  ctx.globalAlpha = 1;
+
+  // -- Enemy bullets
+  enemyBullets.forEach(b => {
+    if (b.missile) {
+      ctx.fillStyle = '#ff4444';
+      ctx.shadowColor = '#ff0000';
+      ctx.shadowBlur = 6;
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    } else {
+      ctx.fillStyle = '#ff8800';
+      ctx.shadowColor = '#ff8800';
+      ctx.shadowBlur = 4;
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+  });
+
+  // -- Enemies
+  enemies.forEach(e => {
+    if (!e.active) return;
+
+    // HP bar
+    if (e.maxHp > 1) {
+      ctx.fillStyle = '#333';
+      ctx.fillRect(e.x - e.w / 2, e.y - e.h / 2 - 6, e.w, 3);
+      ctx.fillStyle = e.hp / e.maxHp > 0.3 ? '#e74c3c' : '#ff0';
+      ctx.fillRect(e.x - e.w / 2, e.y - e.h / 2 - 6, e.w * (e.hp / e.maxHp), 3);
+    }
+
+    switch (e.type) {
+      case 'drone': drawDrone(e.x, e.y, e.animT); break;
+      case 'tank': drawTank(e.x, e.y, e.animT); break;
+      case 'heavy': drawHeavyMecha(e.x, e.y, e.animT); break;
+    }
+  });
+
+  // -- Power-up items
+  items.forEach(item => {
+    const pulse = Math.sin(item.animT * 0.15) * 3;
+    const sz = 10 + pulse;
+
+    // Glow
+    ctx.fillStyle = 'rgba(0,229,255,0.2)';
+    ctx.beginPath();
+    ctx.arc(item.x, item.y, sz + 6, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Item body
+    ctx.fillStyle = '#00e5ff';
+    ctx.shadowColor = '#00e5ff';
+    ctx.shadowBlur = 10;
+    ctx.beginPath();
+    ctx.arc(item.x, item.y, sz, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // "P" label
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 12px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('P', item.x, item.y + 1);
+  });
+
+  // -- Player bullets (leaf energy beams)
+  playerBullets.forEach(b => {
+    if (b.wide) {
+      // Thick main beam (golden)
+      ctx.fillStyle = 'rgba(255,215,0,0.3)';
+      ctx.fillRect(b.x - 6, b.y - 4, 12, 8);
+      ctx.fillStyle = '#ffd700';
+      ctx.shadowColor = '#ffd700';
+      ctx.shadowBlur = 12;
+      ctx.fillRect(b.x - 4, b.y - 3, 8, 6);
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(b.x - 2, b.y - 1, 4, 3);
+      ctx.shadowBlur = 0;
+    } else {
+      ctx.fillStyle = '#66dd44';
+      ctx.shadowColor = '#66dd44';
+      ctx.shadowBlur = 8;
+      ctx.fillRect(b.x - 1.5, b.y - 6, 3, 12);
+      ctx.fillStyle = '#ccffaa';
+      ctx.fillRect(b.x - 0.5, b.y - 4, 1, 8);
+      ctx.shadowBlur = 0;
+    }
+  });
+
+  // -- Player
+  if (player.invincible <= 0 || Math.floor(player.invincible / 4) % 2 === 0) {
+    drawPlayerMecha(player.x, player.y, player.power, player.animFrame);
+  }
+
+  // Hitbox indicator (small dot)
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.beginPath();
+  ctx.arc(player.x, player.y, 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // -- Particles
+  particles.forEach(p => {
+    ctx.globalAlpha = p.life / p.maxLife;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  });
+  ctx.globalAlpha = 1;
+
+  // -- Flash
+  if (flashAlpha > 0) {
+    ctx.fillStyle = `rgba(0,229,255,${flashAlpha})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // -- Warning
+  if (warningActive) {
+    ctx.fillStyle = `rgba(255,0,0,${0.08 + Math.sin(gameTime * 0.3) * 0.08})`;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#ff0000';
+    ctx.font = 'bold 50px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.globalAlpha = 0.5 + Math.sin(gameTime * 0.4) * 0.5;
+    ctx.fillText('⚠ WARNING ⚠', W / 2, H / 2);
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore();
+
+  // -- HUD
+  drawHUD();
+}
+
+function drawHUD() {
+  ctx.textBaseline = 'top';
+
+  // Score
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 20px "Courier New", monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(`SCORE: ${score.toLocaleString()}`, 20, 16);
+
+  ctx.fillStyle = '#888';
+  ctx.font = '13px "Courier New", monospace';
+  ctx.fillText(`HI: ${highScore.toLocaleString()}`, 20, 40);
+
+  // Combo
+  if (combo > 1) {
+    ctx.fillStyle = combo >= 5 ? '#ffcc00' : '#00e5ff';
+    ctx.font = `bold ${16 + Math.min(combo, 10)}px "Courier New", monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText(`× ${combo} COMBO!`, W / 2, 16);
+  }
+
+  // HP
+  ctx.textAlign = 'right';
+  ctx.font = '18px "Courier New", monospace';
+  let hpStr = '';
+  for (let i = 0; i < player.maxHp; i++) {
+    hpStr += i < player.hp ? '♥' : '♡';
+  }
+  ctx.fillStyle = player.hp <= 2 ? '#ff4444' : '#00e5ff';
+  ctx.fillText(hpStr, W - 20, 16);
+
+  // Power level
+  ctx.font = 'bold 14px "Courier New", monospace';
+  const pwrColors = ['#888', '#00e5ff', '#66dd44', '#ffd700', '#ff6600'];
+  const pwrIdx = Math.min(player.power, 5) - 1;
+  ctx.fillStyle = pwrColors[pwrIdx];
+  const pwrBar = '▮'.repeat(player.power) + '▯'.repeat(5 - player.power);
+  const pwrLabel = player.power >= 5 ? 'POWER: ▮▮▮▮▮ MAX 🔥' : `POWER: ${pwrBar} Lv${player.power}`;
+  ctx.fillText(pwrLabel, W - 20, 38);
+
+  // 次のアイテムまでのkillカウンター
+  if (player.power < 5) {
+    const remaining = nextItemAt - killCounter;
+    ctx.fillStyle = '#666';
+    ctx.font = '11px "Courier New", monospace';
+    ctx.fillText(`次のP まで: ${remaining}体`, W - 20, 58);
+  }
+
+  // Time
+  ctx.fillStyle = '#555';
+  ctx.font = '12px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  const seconds = Math.floor(gameTime / 60);
+  ctx.fillText(`${Math.floor(seconds / 60)}:${(seconds % 60).toString().padStart(2, '0')}`, W / 2, H - 18);
+}
+
+// ============================================================
+// Star Wars-style Story Text
+// ============================================================
+const storyLines = [
+  'エピソード 1',
+  '',
+  'カブの大冒険',
+  '',
+  '',
+  'はるか彼方の畑で、',
+  '一つのカブが目覚めた。',
+  '',
+  '彼の名はカブ太郎。',
+  '普通のカブとして生まれ、',
+  '普通にスーパーで売られるはずだった。',
+  '',
+  'しかし運命は残酷だった。',
+  '出荷の日、トラックが',
+  '宇宙人に襲われたのだ。',
+  '',
+  '気がつくとカブ太郎は',
+  '宇宙のど真ん中にいた。',
+  '',
+  '「なぜ俺が...」',
+  '「俺はただのカブなのに...」',
+  '',
+  'だが泣いている暇はない。',
+  '謎のメカ軍団が',
+  '地球の野菜を全て',
+  '支配しようとしている。',
+  '',
+  '今、カブ太郎は立ち上がる。',
+  '葉っぱから放つ謎のビームで',
+  '宇宙の平和を守るために。',
+  '',
+  '目指すは銀河の果て。',
+  '最強の根菜になるために。',
+  '',
+  '',
+  '「漬物にされてたまるか」',
+  '',
+  '',
+  '— カブ太郎、出撃前の名言',
+];
+
+// ============================================================
+// Title Screen
+// ============================================================
+function drawTitle() {
+  const skyGrad = ctx.createLinearGradient(0, 0, 0, H);
+  skyGrad.addColorStop(0, '#050510');
+  skyGrad.addColorStop(0.6, '#0a0a2e');
+  skyGrad.addColorStop(1, '#1a0a3e');
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars
+  stars.forEach(s => {
+    ctx.globalAlpha = s.brightness * 0.8;
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(s.x, s.y, s.size, s.size);
+  });
+  ctx.globalAlpha = 1;
+
+  // Title
+  ctx.fillStyle = '#ffd700';
+  ctx.font = 'bold 56px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.shadowColor = '#ffd700';
+  ctx.shadowBlur = 15;
+  ctx.fillText('カブの大冒険', W / 2, H / 2 - 100);
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = '#00e5ff';
+  ctx.font = '14px "Courier New", monospace';
+  ctx.fillText('KABU NO DAIBOUKEN — A TURNIP SPACE OPERA', W / 2, H / 2 - 55);
+
+  // Kabu preview
+  drawPlayerMecha(W / 2, H / 2 + 15, 3, Date.now() / 50);
+
+  // Start prompt
+  ctx.fillStyle = '#ffd700';
+  ctx.globalAlpha = 0.5 + Math.sin(Date.now() * 0.005) * 0.5;
+  ctx.font = '22px "Courier New", monospace';
+  ctx.fillText('クリックでストーリー開始', W / 2, H / 2 + 120);
+  ctx.globalAlpha = 1;
+
+  // Controls
+  ctx.fillStyle = '#666';
+  ctx.font = '14px "Courier New", monospace';
+  ctx.fillText('MOUSE: 移動  |  自動発射  |  [P] でパワーアップ', W / 2, H - 30);
+
+  if (highScore > 0) {
+    ctx.fillStyle = '#ffcc00';
+    ctx.fillText(`HIGH SCORE: ${highScore.toLocaleString()}`, W / 2, H - 55);
+  }
+}
+
+// ============================================================
+// Story Scroll (Star Wars style)
+// ============================================================
+function drawStory() {
+  // Background
+  const skyGrad = ctx.createLinearGradient(0, 0, 0, H);
+  skyGrad.addColorStop(0, '#050510');
+  skyGrad.addColorStop(0.5, '#0a0a2e');
+  skyGrad.addColorStop(1, '#050510');
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars
+  stars.forEach(s => {
+    ctx.globalAlpha = s.brightness * 0.6;
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(s.x, s.y, s.size, s.size);
+  });
+  ctx.globalAlpha = 1;
+
+  // Perspective scrolling text
+  ctx.save();
+
+  // Create perspective effect using a clipping region
+  const centerX = W / 2;
+  const perspY = H * 0.85; // vanishing point area
+
+  // Fade mask at top and bottom
+  const elapsed = (Date.now() - storyStartTime) / 1000;
+  const scrollOffset = elapsed * 40; // scroll speed (pixels per second)
+
+  const lineHeight = 32;
+  const totalHeight = storyLines.length * lineHeight + H;
+
+  // Draw each line with perspective simulation
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  for (let i = 0; i < storyLines.length; i++) {
+    const baseY = H * 0.9 + i * lineHeight - scrollOffset;
+
+    // Skip if above or below visible range
+    if (baseY < -30 || baseY > H + 30) continue;
+
+    // Perspective: lines higher up are smaller and more transparent
+    const progress = (perspY - baseY) / perspY; // 0 at bottom, 1 at vanishing point
+    const scale = Math.max(0.2, 1 - progress * 0.7);
+    const alpha = baseY < H * 0.15 ? baseY / (H * 0.15) :
+                  baseY > H * 0.85 ? (H - baseY) / (H * 0.15) : 1;
+
+    if (alpha <= 0) continue;
+
+    ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+
+    const line = storyLines[i];
+    const isTitle = line === 'カブの大冒険';
+    const isEpisode = line === 'エピソード 1';
+    const isQuote = line.startsWith('「') || line.startsWith('—');
+
+    if (isTitle) {
+      ctx.fillStyle = '#ffd700';
+      ctx.font = `bold ${Math.round(36 * scale)}px "Courier New", monospace`;
+    } else if (isEpisode) {
+      ctx.fillStyle = '#00e5ff';
+      ctx.font = `bold ${Math.round(20 * scale)}px "Courier New", monospace`;
+    } else if (isQuote) {
+      ctx.fillStyle = '#ffcc66';
+      ctx.font = `italic ${Math.round(18 * scale)}px "Courier New", monospace`;
+    } else {
+      ctx.fillStyle = '#ffd700';
+      ctx.font = `${Math.round(18 * scale)}px "Courier New", monospace`;
+    }
+
+    ctx.fillText(line, centerX, baseY);
+  }
+
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // Skip prompt
+  ctx.fillStyle = '#555';
+  ctx.font = '14px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText('クリックでスキップ', W / 2, H - 15);
+
+  // Auto-transition when scroll finishes
+  if (scrollOffset > totalHeight + 100) {
+    gameState = 'playing';
+    resetGame();
+  }
+}
+
+// ============================================================
+// Game Over Screen
+// ============================================================
+function drawGameOver() {
+  render();
+
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textBaseline = 'middle';
+
+  ctx.fillStyle = '#ff4444';
+  ctx.font = 'bold 48px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('カブ太郎 散る...', W / 2, H / 2 - 60);
+
+  ctx.fillStyle = '#fff';
+  ctx.font = '24px "Courier New", monospace';
+  ctx.fillText(`SCORE: ${score.toLocaleString()}`, W / 2, H / 2);
+
+  if (score >= highScore && score > 0) {
+    ctx.fillStyle = '#ffcc00';
+    ctx.font = 'bold 18px "Courier New", monospace';
+    ctx.fillText('★ NEW HIGH SCORE! ★', W / 2, H / 2 + 35);
+  }
+
+  const seconds = Math.floor(gameTime / 60);
+  ctx.fillStyle = '#888';
+  ctx.font = '16px "Courier New", monospace';
+  ctx.fillStyle = DIFFICULTY_COLORS[selectedDifficulty];
+  ctx.fillText(`${DIFFICULTY_NAMES[selectedDifficulty]}  |  Time: ${Math.floor(seconds / 60)}:${(seconds % 60).toString().padStart(2, '0')}  |  Power: Lv${player.power}`, W / 2, H / 2 + 70);
+
+  ctx.fillStyle = '#ffd700';
+  ctx.font = '14px "Courier New", monospace';
+  ctx.fillText('「漬物にされてたまるか...もう一度...」', W / 2, H / 2 + 95);
+
+  ctx.fillStyle = '#00e5ff';
+  ctx.globalAlpha = 0.5 + Math.sin(Date.now() * 0.005) * 0.5;
+  ctx.font = '22px "Courier New", monospace';
+  ctx.fillText('クリックで難易度選択へ', W / 2, H / 2 + 130);
+  ctx.globalAlpha = 1;
+}
+
+// ============================================================
+// Reset
+// ============================================================
+function resetGame() {
+  player.x = W / 2;
+  player.y = H * 0.75;
+  player.maxHp = getDiff('playerHp');
+  player.hp = player.maxHp;
+  player.power = 1;
+  player.shootCooldown = 0;
+  player.invincible = 60;
+  player.animFrame = 0;
+
+  playerBullets = [];
+  enemyBullets = [];
+  enemies = [];
+  particles = [];
+  items = [];
+  killCounter = 0;
+  nextItemAt = 15 + Math.floor(Math.random() * 6); // 最初は15〜20
+
+  score = 0;
+  combo = 0;
+  comboTimer = 0;
+  gameTime = 0;
+  warningTimer = 0;
+  warningActive = false;
+  screenShake = 0;
+  flashAlpha = 0;
+  spawnTimer = 0;
+}
+
+// ============================================================
+// Game Loop
+// ============================================================
+let canClick = true;
+
+// ============================================================
+// Difficulty Selection Screen
+// ============================================================
+let diffHover = -1;
+
+function drawDifficultySelect() {
+  const skyGrad = ctx.createLinearGradient(0, 0, 0, H);
+  skyGrad.addColorStop(0, '#050510');
+  skyGrad.addColorStop(0.5, '#0a0a2e');
+  skyGrad.addColorStop(1, '#1a0a3e');
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  stars.forEach(s => {
+    ctx.globalAlpha = s.brightness * 0.8;
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(s.x, s.y, s.size, s.size);
+  });
+  ctx.globalAlpha = 1;
+
+  ctx.fillStyle = '#ffd700';
+  ctx.font = 'bold 36px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('難易度をえらべ', W / 2, 80);
+
+  // 3 difficulty cards
+  const cardW = 220;
+  const cardH = 260;
+  const gap = 40;
+  const startX = W / 2 - (cardW * 3 + gap * 2) / 2;
+
+  for (let i = 0; i < 3; i++) {
+    const cx = startX + i * (cardW + gap) + cardW / 2;
+    const cy = H / 2 + 10;
+    const isHover = diffHover === i;
+    const isDefault = i === 0;
+
+    // Card background
+    ctx.fillStyle = isHover ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.05)';
+    ctx.strokeStyle = isHover ? DIFFICULTY_COLORS[i] : 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = isHover ? 3 : 1;
+    ctx.beginPath();
+    ctx.roundRect(cx - cardW / 2, cy - cardH / 2, cardW, cardH, 12);
+    ctx.fill();
+    ctx.stroke();
+
+    // Default badge
+    if (isDefault) {
+      ctx.fillStyle = '#44cc44';
+      ctx.font = '11px "Courier New", monospace';
+      ctx.fillText('★ おすすめ', cx, cy - cardH / 2 + 20);
+    }
+
+    // Difficulty name
+    ctx.fillStyle = DIFFICULTY_COLORS[i];
+    ctx.font = 'bold 26px "Courier New", monospace';
+    ctx.fillText(DIFFICULTY_NAMES[i], cx, cy - 40);
+
+    // Kabu preview at this difficulty
+    const previewScale = 0.8;
+    ctx.save();
+    ctx.translate(cx, cy + 10);
+    ctx.scale(previewScale, previewScale);
+    drawPlayerMecha(0, 0, 1, Date.now() / 50);
+    ctx.restore();
+
+    // HP display
+    ctx.fillStyle = '#888';
+    ctx.font = '13px "Courier New", monospace';
+    ctx.fillText(`HP: ${'♥'.repeat(DIFF.playerHp[i])}`, cx, cy + 60);
+
+    // Description
+    ctx.fillStyle = '#aaa';
+    ctx.font = '12px "Courier New", monospace';
+    ctx.fillText(DIFFICULTY_DESC[i], cx, cy + 85);
+
+    // Click area data
+    if (!drawDifficultySelect._areas) drawDifficultySelect._areas = [];
+    drawDifficultySelect._areas[i] = {
+      x: cx - cardW / 2, y: cy - cardH / 2, w: cardW, h: cardH
+    };
+  }
+
+  ctx.fillStyle = '#555';
+  ctx.font = '13px "Courier New", monospace';
+  ctx.fillText('クリックで選択', W / 2, H - 30);
+}
+
+// Track mouse hover for difficulty cards
+canvas.addEventListener('mousemove', e => {
+  if (gameState !== 'difficulty') return;
+  const rect = canvas.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) * (W / rect.width);
+  const my = (e.clientY - rect.top) * (H / rect.height);
+
+  diffHover = -1;
+  const areas = drawDifficultySelect._areas;
+  if (areas) {
+    for (let i = 0; i < 3; i++) {
+      const a = areas[i];
+      if (mx >= a.x && mx <= a.x + a.w && my >= a.y && my <= a.y + a.h) {
+        diffHover = i;
+        break;
+      }
+    }
+  }
+});
+
+function handleClick(e) {
+  if (!canClick) return;
+  canClick = false;
+  setTimeout(() => canClick = true, 300);
+
+  if (gameState === 'title') {
+    gameState = 'difficulty';
+    drawDifficultySelect._areas = null;
+  } else if (gameState === 'difficulty') {
+    if (diffHover >= 0) {
+      selectedDifficulty = diffHover;
+      gameState = 'story';
+      storyStartTime = Date.now();
+    }
+  } else if (gameState === 'story') {
+    gameState = 'playing';
+    resetGame();
+  } else if (gameState === 'gameover') {
+    gameState = 'difficulty';
+    drawDifficultySelect._areas = null;
+  }
+}
+
+canvas.addEventListener('mousedown', handleClick);
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  handleClick(e);
+}, { passive: false });
+
+function gameLoop() {
+  update();
+
+  ctx.clearRect(0, 0, W, H);
+  if (gameState === 'title') {
+    drawTitle();
+  } else if (gameState === 'difficulty') {
+    drawDifficultySelect();
+  } else if (gameState === 'story') {
+    drawStory();
+  } else if (gameState === 'playing') {
+    render();
+  } else if (gameState === 'gameover') {
+    drawGameOver();
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+gameLoop();
+</script>
+</body>
+</html>
